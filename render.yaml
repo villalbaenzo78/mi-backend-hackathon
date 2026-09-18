@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: plataforma-educativa-ia
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NVIDIA_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
