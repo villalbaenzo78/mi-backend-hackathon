@@ -6,11 +6,12 @@ const pdfParse = require("pdf-parse");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 const NVIDIA_MODEL = process.env.NVIDIA_MODEL || "nvidia/llama-3.1-nemotron-70b-instruct";
+const NVIDIA_VISION_MODEL = process.env.NVIDIA_VISION_MODEL || "meta/llama-3.2-11b-vision-instruct";
 const NVIDIA_KEY = process.env.NVIDIA_API_KEY || "";
 const SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search";
 
@@ -97,26 +98,75 @@ async function buscarCrossref(query) {
 }
 
 async function llamarNvidia(systemMsg, userMsg) {
-  const res = await fetch(NVIDIA_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${NVIDIA_KEY}`,
-    },
-    body: JSON.stringify({
-      model: NVIDIA_MODEL,
-      temperature: 0.3,
-      max_tokens: 700,
-      messages: [
-        { role: "system", content: systemMsg },
-        { role: "user", content: userMsg },
-      ],
-    }),
-  });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 120000);
+  let res;
+  try {
+    res = await fetch(NVIDIA_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${NVIDIA_KEY}`,
+      },
+      body: JSON.stringify({
+        model: NVIDIA_MODEL,
+        temperature: 0.3,
+        max_tokens: 700,
+        messages: [
+          { role: "system", content: systemMsg },
+          { role: "user", content: userMsg },
+        ],
+      }),
+      signal: ctl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+  clearTimeout(timer);
   if (!res.ok) throw new Error("NVIDIA API error " + res.status);
   const data = await res.json();
   const texto = data.choices?.[0]?.message?.content || "";
   return texto.trim();
+}
+
+/* Interpreta una imagen (base64 sin prefijo "data:") usando un modelo de visión. */
+async function describirImagen(base64, mime) {
+  const dataUrl = "data:" + (mime || "image/jpeg") + ";base64," + base64;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 90000);
+  let res;
+  try {
+    res = await fetch(NVIDIA_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${NVIDIA_KEY}`,
+      },
+      body: JSON.stringify({
+        model: NVIDIA_VISION_MODEL,
+        temperature: 0.2,
+        max_tokens: 500,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Sos una IA educativa para estudiantes de secundaria. Describí esta imagen en detalle como si la estuvieras explicando a un alumno: qué contiene, qué concepto o tema se ve, y qué puntos clave debería recordar. Respondé en español de Argentina, directo y breve." },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+      signal: ctl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+  clearTimeout(timer);
+  if (!res.ok) throw new Error("Vision API error " + res.status);
+  const data = await res.json();
+  return (data.choices?.[0]?.message?.content || "").trim();
 }
 
 const FILOSOFIA =
@@ -127,13 +177,36 @@ const FILOSOFIA =
   "4) Texto breve: maximo 2-3 parrafos o pasos numerados cortos.";
 
 app.post("/api/chat", async (req, res) => {
-  const { pregunta, materiaNombre, materiales, historial } = req.body || {};
+  const { pregunta, materiaNombre, materiales, historial, adjuntos } = req.body || {};
 
   if (!NVIDIA_KEY) {
     return res.json({ usarDemo: true });
   }
 
   try {
+    /* 1) Adjuntos: interpretar imágenes con visión y armar bloque de contexto */
+    let bloqueAdjuntos = "";
+    if (Array.isArray(adjuntos) && adjuntos.length) {
+      const descripciones = [];
+      for (const adj of adjuntos.slice(0, 3)) {
+        if (adj.tipo === "imagen" && adj.base64) {
+          try {
+            const desc = await describirImagen(adj.base64, adj.mime);
+            descripciones.push(`[Imagen adjunta "${adj.nombre || "imagen"}"] Descripcion: ${desc}`);
+          } catch (e) {
+            descripciones.push(`[Imagen adjunta "${adj.nombre || "imagen"}"] (no se pudo interpretar)`);
+          }
+        } else if (adj.tipo === "texto" && adj.texto) {
+          descripciones.push(`[Archivo adjunto "${adj.nombre || "archivo"}"]\n${String(adj.texto).slice(0, 6000)}`);
+        } else if (adj.tipo === "pdf" && adj.texto) {
+          descripciones.push(`[PDF adjunto "${adj.nombre || "documento"}" extraido]\n${String(adj.texto).slice(0, 6000)}`);
+        }
+      }
+      if (descripciones.length) {
+        bloqueAdjuntos = "ADJUNTOS DEL ESTUDIANTE EN ESTE MENSAJE:\n" + descripciones.join("\n\n");
+      }
+    }
+
     const relevantes = rankearMateriales(materiales, pregunta);
     const contexto = relevantes.length
       ? relevantes.map((r, i) => `[Material ${i + 1}] ${r.texto.slice(0, 900)}`).join("\n\n")
@@ -151,9 +224,10 @@ app.post("/api/chat", async (req, res) => {
       ``,
       `FUENTES ACADEMICAS DETECTADAS (podes citarlas si son utiles):\n${fuentesAcad}`,
       ``,
+      ...(bloqueAdjuntos ? [bloqueAdjuntos, ``] : []),
       `PREGUNTA DEL ESTUDIANTE: ${pregunta}`,
       ``,
-      `Al final de tu respuesta, en una linea aparte que empiece con FUENTES:, listar las fuentes que usaste (del material o academicas) separadas por ' | '. Si ninguna es util o no encontraste, escribi: FUENTES: Material del estudiante`,
+      `Al final de tu respuesta, en una linea aparte que empiece con FUENTES:, listar las fuentes que usaste (del material, los adjuntos o academicas) separadas por ' | '. Si ninguna es util o no encontraste, escribi: FUENTES: Material del estudiante`,
     ].join("\n");
 
     const historialMsg = (historial || [])
@@ -193,6 +267,50 @@ app.post("/api/chat", async (req, res) => {
   } catch (err) {
     console.error("Error en /api/chat:", err.message);
     res.json({ usarDemo: true });
+  }
+});
+
+/* Genera un resumen real por IA: recibe la materia y sus materiales (o un texto pegado). */
+app.post("/api/resumir", async (req, res) => {
+  const { materiaId, materiaNombre, materiales, texto } = req.body || {};
+
+  if (!NVIDIA_KEY) return res.json({ usarDemo: true });
+
+  const fuenteTexto = Array.isArray(texto) && texto.length ? texto.join("\n") : String(texto || "");
+  const fuenteMaterial = (Array.isArray(materiales) ? materiales : [])
+    .filter(Boolean)
+    .map((m, i) => `[Material ${i + 1}] ${String(m).slice(0, 3000)}`)
+    .join("\n\n");
+  const cuerpo = fuenteTexto || fuenteMaterial;
+  if (!cuerpo.trim()) return res.json({ usarDemo: true, error: "Sin contenido para resumir" });
+
+  try {
+    const sysResumen =
+      "Sos una IA de apoyo al estudio que genera resumenes claros para estudiantes de secundaria. " +
+      "Devolveme el resumen del material que te paso, SIEMPRE en este formato exacto:\n" +
+      "TEMA: <tema central>\n\n" +
+      "IDEA CENTRAL: <1 oracion que resuma todo>\n\n" +
+      "PUNTOS CLAVE:\n- <punto 1>\n- <punto 2>\n- <punto 3>\n\n" +
+      "PARA RECORDAR: <consejo o concepto que no hay que olvidar>\n\n" +
+      "No agregues nada fuera de este formato. Respondé en español de Argentina, directo.";
+
+    const userMsg =
+      `Materia: ${materiaNombre || materiaId || "General"}\n\n` +
+      `MATERIAL A RESUMIR:\n${cuerpo.slice(0, 20000)}\n\nGenerá el resumen.`;
+
+    const textoResumen = await llamarNvidia(sysResumen, userMsg);
+
+    res.json({
+      ok: true,
+      usarDemo: false,
+      resumen: textoResumen,
+      materiaId: materiaId || null,
+      materiaNombre: materiaNombre || null,
+      usandoIA: true,
+    });
+  } catch (err) {
+    console.error("Error en /api/resumir:", err.message);
+    res.json({ usarDemo: true, error: err.message });
   }
 });
 
