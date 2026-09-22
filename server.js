@@ -2,7 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const pdfParse = require("pdf-parse");
 
 const app = express();
 app.use(cors());
@@ -220,8 +219,10 @@ app.post("/api/chat", async (req, res) => {
           }
         } else if (adj.tipo === "texto" && adj.texto) {
           descripciones.push(`[Archivo adjunto "${adj.nombre || "archivo"}"]\n${String(adj.texto).slice(0, 6000)}`);
-        } else if (adj.tipo === "pdf" && adj.texto) {
-          descripciones.push(`[PDF adjunto "${adj.nombre || "documento"}" extraido]\n${String(adj.texto).slice(0, 6000)}`);
+        } else if ((adj.tipo === "pdf" || adj.tipo === "docx" || adj.tipo === "word") && adj.texto) {
+          descripciones.push(`[Documento adjunto "${adj.nombre || "documento"}" extraido]\n${String(adj.texto).slice(0, 6000)}`);
+        } else if (adj.texto) {
+          descripciones.push(`[Archivo adjunto "${adj.nombre || "archivo"}"]\n${String(adj.texto).slice(0, 6000)}`);
         }
       }
       if (descripciones.length) {
@@ -382,28 +383,49 @@ app.post("/api/generar-quiz", async (req, res) => {
   }
 });
 
+/* Extrae el texto de un PDF (.pdf vía pdf-parse v2) o Word (.docx vía mammoth). */
 app.post("/api/extraer-pdf", async (req, res) => {
   const { nombre, base64 } = req.body || {};
   if (!base64) return res.json({ usarDemo: true, error: "sin archivo" });
 
   try {
-    const buf = Buffer.from(base64, "base64");
-    const data = await pdfParse(PDFParseOptionsPiper(buf));
-    const texto = String(data.text || "").slice(0, 30000).trim();
-    if (!texto) return res.json({ usarDemo: true, error: "PDF no tiene texto extraíble (puede ser escaneado)" });
-    res.json({ ok: true, nombre: String(nombre || "apunte.pdf"), texto: texto });
+    let texto = "";
+    if (!texto) texto = await extraerTextoArchivo(nombre, base64);
+    texto = String(texto || "").slice(0, 30000).trim();
+    if (!texto) {
+      return res.json({
+        usarDemo: true,
+        error: "No se pudo extraer texto (¿PDF escaneado sin capa de texto, o formato Word viejo .doc? Probá .txt o .docx).",
+      });
+    }
+    res.json({ ok: true, nombre: String(nombre || "apunte"), texto: texto });
   } catch (err) {
     console.error("Error en /api/extraer-pdf:", err.message);
     res.json({ usarDemo: true, error: err.message });
   }
 });
 
-function PDFParseOptionsPiper(buf) {
-const pdfParse = require("pdf-parse");
-  return buf; /* pdf-parse acepta Buffer directamente */
+async function extraerTextoArchivo(nombre, base64) {
+  const buf = Buffer.from(base64, "base64");
+  const n = String(nombre || "").toLowerCase();
+  if (/\.pdf$/i.test(n)) {
+    const { PDFParse } = require("pdf-parse");
+    const pdf = new PDFParse({ data: buf });
+    const data = await pdf.getText();
+    return String(data.text || "");
+  }
+  if (/\.docx$/i.test(n)) {
+    const mammoth = require("mammoth");
+    const r = await mammoth.extractRawText({ buffer: buf });
+    return String(r.value || "");
+  }
+  if (/\.doc$/i.test(n)) {
+    throw new Error("Formato Word viejo (.doc) no soportado: convertilo a .docx");
+  }
+  return String(base64); /* fallback: devolver la cadena base64 sin sentido */
 }
 
 app.listen(PORT, () => {
   console.log(`Plataforma educativa escuchando en http://localhost:${PORT}`);
-  console.log(`IA real: ${NVIDIA_KEY ? "CONECTADA (" + NVIDIA_MODEL + ")" : "sin API key -> modo demo"}`);
+  console.log(`IA real: ${GROQ_KEY ? "Groq (" + GROQ_MODEL + ")" : NVIDIA_KEY ? "NVIDIA (" + NVIDIA_MODEL + ")" : "sin API key -> modo demo"}`);
 });
