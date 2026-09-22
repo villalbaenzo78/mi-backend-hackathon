@@ -13,12 +13,16 @@ const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 const NVIDIA_MODEL = process.env.NVIDIA_MODEL || "nvidia/llama-3.1-nemotron-70b-instruct";
 const NVIDIA_VISION_MODEL = process.env.NVIDIA_VISION_MODEL || "meta/llama-3.2-11b-vision-instruct";
 const NVIDIA_KEY = process.env.NVIDIA_API_KEY || "";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search";
 
 app.use(express.static(path.join(__dirname, "..")));
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, iaReal: !!NVIDIA_KEY });
+  const proveedor = GROQ_KEY ? "Groq" : NVIDIA_KEY ? "NVIDIA" : "demo";
+  res.json({ ok: true, iaReal: !!(GROQ_KEY || NVIDIA_KEY), proveedor });
 });
 
 function normalizar(t) {
@@ -97,19 +101,37 @@ async function buscarCrossref(query) {
   }
 }
 
-async function llamarNvidia(systemMsg, userMsg) {
+/* Llama al LLM de texto: Groq (rápido) si hay key, sino NVIDIA. Si el primero falla, prueba el otro. */
+async function llamarIA(systemMsg, userMsg) {
+  const proveedores = [];
+  if (GROQ_KEY) proveedores.push({ nombre: "Groq", url: GROQ_URL, key: GROQ_KEY, model: GROQ_MODEL });
+  if (NVIDIA_KEY) proveedores.push({ nombre: "NVIDIA", url: NVIDIA_URL, key: NVIDIA_KEY, model: NVIDIA_MODEL });
+  if (!proveedores.length) throw new Error("Sin API key configurada");
+  let ultimoError = null;
+  for (const prov of proveedores) {
+    try {
+      return await llamarProveedor(prov, systemMsg, userMsg);
+    } catch (e) {
+      ultimoError = e;
+      console.error(`Fallo ${prov.nombre}:`, e.message);
+    }
+  }
+  throw ultimoError || new Error("Todos los proveedores fallaron");
+}
+
+async function llamarProveedor(prov, systemMsg, userMsg) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 120000);
   let res;
   try {
-    res = await fetch(NVIDIA_URL, {
+    res = await fetch(prov.url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${NVIDIA_KEY}`,
+        Authorization: `Bearer ${prov.key}`,
       },
       body: JSON.stringify({
-        model: NVIDIA_MODEL,
+        model: prov.model,
         temperature: 0.3,
         max_tokens: 700,
         messages: [
@@ -124,7 +146,7 @@ async function llamarNvidia(systemMsg, userMsg) {
     throw e;
   }
   clearTimeout(timer);
-  if (!res.ok) throw new Error("NVIDIA API error " + res.status);
+  if (!res.ok) throw new Error(prov.nombre + " API error " + res.status);
   const data = await res.json();
   const texto = data.choices?.[0]?.message?.content || "";
   return texto.trim();
@@ -179,7 +201,7 @@ const FILOSOFIA =
 app.post("/api/chat", async (req, res) => {
   const { pregunta, materiaNombre, materiales, historial, adjuntos } = req.body || {};
 
-  if (!NVIDIA_KEY) {
+  if (!GROQ_KEY && !NVIDIA_KEY) {
     return res.json({ usarDemo: true });
   }
 
@@ -237,7 +259,7 @@ app.post("/api/chat", async (req, res) => {
 
     const systemMsg = FILOSOFIA + "\n\nHistorial reciente:\n" + (historialMsg || "(sin historial)");
 
-    const texto = await llamarNvidia(systemMsg, userMsg);
+    const texto = await llamarIA(systemMsg, userMsg);
 
     let textosFuentes = [];
     const m = texto.match(/FUENTES:\s*(.+)$/s);
@@ -274,7 +296,7 @@ app.post("/api/chat", async (req, res) => {
 app.post("/api/resumir", async (req, res) => {
   const { materiaId, materiaNombre, materiales, texto } = req.body || {};
 
-  if (!NVIDIA_KEY) return res.json({ usarDemo: true });
+  if (!GROQ_KEY && !NVIDIA_KEY) return res.json({ usarDemo: true });
 
   const fuenteTexto = Array.isArray(texto) && texto.length ? texto.join("\n") : String(texto || "");
   const fuenteMaterial = (Array.isArray(materiales) ? materiales : [])
@@ -298,7 +320,7 @@ app.post("/api/resumir", async (req, res) => {
       `Materia: ${materiaNombre || materiaId || "General"}\n\n` +
       `MATERIAL A RESUMIR:\n${cuerpo.slice(0, 20000)}\n\nGenerá el resumen.`;
 
-    const textoResumen = await llamarNvidia(sysResumen, userMsg);
+    const textoResumen = await llamarIA(sysResumen, userMsg);
 
     res.json({
       ok: true,
@@ -318,7 +340,7 @@ app.post("/api/resumir", async (req, res) => {
 app.post("/api/generar-quiz", async (req, res) => {
   const { materiaId, materiaNombre, materiales } = req.body || {};
 
-  if (!NVIDIA_KEY) return res.json({ usarDemo: true });
+  if (!GROQ_KEY && !NVIDIA_KEY) return res.json({ usarDemo: true });
   if (!Array.isArray(materiales) || !materiales.length) return res.json({ usarDemo: true });
 
   try {
@@ -334,7 +356,7 @@ app.post("/api/generar-quiz", async (req, res) => {
       '\n[{"p":"pregunta","opciones":["a","b","c","d"],"correcta":INDICE_0_A_3,"explicacion":"breve explicacion"}, ...]' +
       "\nCada pregunta debe tener 4 opciones, una correcta (índice 0-3) y una explicación corta que refuerce el concepto.";
 
-    const texto = await llamarNvidia(sysQuiz, "MATERIAL:\n\n" + materialCtx + "\n\nGenerá el quiz JSON.");
+    const texto = await llamarIA(sysQuiz, "MATERIAL:\n\n" + materialCtx + "\n\nGenerá el quiz JSON.");
 
     /* Parseo robusto: extraer el primer array [ ... ] del texto */
     const ini = texto.indexOf("[");
