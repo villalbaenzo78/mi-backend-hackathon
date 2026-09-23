@@ -337,6 +337,40 @@ app.post("/api/resumir", async (req, res) => {
   }
 });
 
+/* Extrae un array JSON [ ... ] del texto, tolerando fences markdown y corchetes anidados dentro de strings. */
+function extraerArrayJson(texto) {
+  const t = String(texto || "")
+    .replace(/```(?:json)?/gi, "")
+    .trim();
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== "[") continue;
+    let profundidad = 0;
+    let enString = false;
+    for (let j = i; j < t.length; j++) {
+      const ch = t[j];
+      if (enString) {
+        if (ch === "\\") { j++; continue; }
+        if (ch === '"') enString = false;
+        continue;
+      }
+      if (ch === '"') { enString = true; continue; }
+      if (ch === "[") profundidad++;
+      else if (ch === "]") {
+        profundidad--;
+        if (profundidad === 0) {
+          try {
+            const porcion = t.slice(i, j + 1);
+            const parsed = JSON.parse(porcion);
+            return parsed;
+          } catch { break; }
+        }
+      }
+      if (profundidad > 40) break;
+    }
+  }
+  return null;
+}
+
 /* Genera un quiz real por IA: recibe la materia y sus materiales, pide JSON a NVIDIA. */
 app.post("/api/generar-quiz", async (req, res) => {
   const { materiaId, materiaNombre, materiales } = req.body || {};
@@ -359,11 +393,8 @@ app.post("/api/generar-quiz", async (req, res) => {
 
     const texto = await llamarIA(sysQuiz, "MATERIAL:\n\n" + materialCtx + "\n\nGenerá el quiz JSON.");
 
-    /* Parseo robusto: extraer el primer array [ ... ] del texto */
-    const ini = texto.indexOf("[");
-    const fin = texto.lastIndexOf("]");
-    if (ini === -1 || fin <= ini) return res.json({ usarDemo: true, error: "IA no devolvió JSON" });
-    const candidatos = JSON.parse(texto.slice(ini, fin + 1));
+    /* Parseo robusto: sacar fences markdown y extraer el array JSON balanceado con corchetes anidados (evita que "[" o "]" dentro del texto rompan el parseo). */
+    const candidatos = extraerArrayJson(texto);
 
     const preguntas = (Array.isArray(candidatos) ? candidatos : [candidatos])
       .filter((q) => q && q.p && Array.isArray(q.opciones) && q.opciones.length === 4 && typeof q.correcta === "number" && q.correcta >= 0 && q.correcta < 4)
